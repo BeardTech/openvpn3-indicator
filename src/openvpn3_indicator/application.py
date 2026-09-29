@@ -67,6 +67,9 @@ from openvpn3_indicator.status import get_status_icon, get_status_description
 
 DEFAULT_CONFIG_NAME = gettext.gettext('UNKNOWN')
 DEFAULT_SESSION_NAME = gettext.gettext('UNKNOWN')
+STATUS_NOTIFIER_WATCHER_BUS_NAME = 'org.kde.StatusNotifierWatcher'
+STATUS_NOTIFIER_WATCHER_OBJECT_PATH = '/StatusNotifierWatcher'
+STATUS_NOTIFIER_WATCHER_INTERFACE = 'org.kde.StatusNotifierWatcher'
 
 ###
 #
@@ -91,7 +94,6 @@ class Application(Gtk.Application):
         self.connect('startup', self.on_startup)
         self.connect('activate', self.on_activate)
         self.connect('open', self.on_open)
-        self.connect('shutdown', self.on_shutdown)
 
     def on_handle_local_options(self, application, options):
         options = options.end().unpack()
@@ -119,44 +121,33 @@ class Application(Gtk.Application):
             config_path = file.get_path()
             self.action_config_open(config_path)
 
-    def on_shutdown(self, application):
-        self.info('Shutdown')
-        if hasattr(self, 'multi_indicator'):
-            self.multi_indicator.close()
-        if hasattr(self, 'multi_notifier'):
-            self.multi_notifier.close()
-
     def on_startup(self, data):
         self.info(f'Startup')
         DBusGMainLoop(set_as_default=True)
 
         bus = dbus.Bus()
         self.session_bus = bus
-        notifier_fail_count = 0
-        while True:
-            try:
-                bus.get_name_owner('org.kde.StatusNotifierWatcher')
-                break
-            except dbus.exceptions.DBusException:
-                notifier_fail_count += 1
-                if notifier_fail_count > 20:
-                    logging.critical('OpenVPN Indicator requires AppIndicator to run. Please install AppIndicator plugin for your desktop.')
-                    dialog = construct_appindicator_missing_dialog()
-                    dialog.set_visible(True)
-                    dialog.run()
-                    sys.exit(1)
-                else:
-                    time.sleep(0.5)
-
-        self.multi_notifier = MultiNotifier(self, f'{APPLICATION_NAME}')
-        self.notifiers = dict()
+        self.status_notifier_watcher_refresh_generation = 0
+        # Subscribe before the initial availability check so that a watcher
+        # restart during startup cannot be missed.
         self.session_bus.add_signal_receiver(
             self.on_status_notifier_watcher_owner_changed,
             signal_name='NameOwnerChanged',
             dbus_interface='org.freedesktop.DBus',
             bus_name='org.freedesktop.DBus',
-            arg0='org.kde.StatusNotifierWatcher',
+            arg0=STATUS_NOTIFIER_WATCHER_BUS_NAME,
         )
+        if not self.wait_for_status_notifier_watcher():
+            logging.critical('OpenVPN Indicator requires AppIndicator to run. Please install AppIndicator plugin for your desktop.')
+            dialog = construct_appindicator_missing_dialog()
+            dialog.set_visible(True)
+            dialog.run()
+            sys.exit(1)
+
+        self.multi_notifier = MultiNotifier(self, f'{APPLICATION_NAME}')
+        self.notifiers = dict()
+        # GNOME Shell can restart the StatusNotifierWatcher after suspend/resume.
+        # Wait until the new watcher is ready, then republish the indicators.
 
         self.dbus = dbus.SystemBus()
         self.config_manager = openvpn3.ConfigurationManager(self.dbus)
@@ -253,10 +244,75 @@ class Application(Gtk.Application):
         old_owner = str(old_owner)
         new_owner = str(new_owner)
         self.info(f'StatusNotifierWatcher owner changed from {old_owner or "<none>"} to {new_owner or "<none>"}')
+        self.status_notifier_watcher_refresh_generation += 1
         if not new_owner:
             return
+        self.schedule_status_notifier_watcher_refresh(
+            new_owner,
+            self.status_notifier_watcher_refresh_generation,
+        )
+
+    def get_status_notifier_watcher_owner(self):
+        owner = str(self.session_bus.get_name_owner(STATUS_NOTIFIER_WATCHER_BUS_NAME))
+        watcher = self.session_bus.get_object(STATUS_NOTIFIER_WATCHER_BUS_NAME, STATUS_NOTIFIER_WATCHER_OBJECT_PATH)
+        properties = dbus.Interface(watcher, dbus_interface='org.freedesktop.DBus.Properties')
+        properties.Get(STATUS_NOTIFIER_WATCHER_INTERFACE, 'ProtocolVersion')
+        # The watcher can be exported before GNOME's AppIndicator extension
+        # has registered itself as a host.  Registering an indicator at that
+        # point creates an icon with an empty D-Bus menu.
+        if not bool(properties.Get(STATUS_NOTIFIER_WATCHER_INTERFACE, 'IsStatusNotifierHostRegistered')):
+            raise dbus.exceptions.DBusException('StatusNotifierWatcher host is not registered yet')
+        if owner != str(self.session_bus.get_name_owner(STATUS_NOTIFIER_WATCHER_BUS_NAME)):
+            raise dbus.exceptions.DBusException('StatusNotifierWatcher owner changed during availability check')
+        return owner
+
+    def wait_for_status_notifier_watcher(self, retries=20, delay=0.5):
+        for attempt in range(retries):
+            try:
+                self.get_status_notifier_watcher_owner()
+                return True
+            except dbus.exceptions.DBusException:
+                if attempt + 1 < retries:
+                    time.sleep(delay)
+        return False
+
+    def schedule_status_notifier_watcher_refresh(self, expected_owner, expected_generation, attempt=0):
+        delay = min(5000, 250 * (2 ** min(attempt, 5)))
+        self.debug(f'Scheduling StatusNotifierWatcher refresh attempt {attempt + 1} in {delay} ms')
+        GLib.timeout_add(
+            delay,
+            self.refresh_status_notifier_watcher,
+            expected_owner,
+            expected_generation,
+            attempt,
+        )
+
+    def refresh_status_notifier_watcher(self, expected_owner, expected_generation, attempt):
+        if self.status_notifier_watcher_refresh_generation != expected_generation:
+            return False
+        try:
+            current_owner = self.get_status_notifier_watcher_owner()
+            if current_owner != expected_owner:
+                return False
+        except dbus.exceptions.DBusException:
+            self.debug(f'StatusNotifierWatcher refresh attempt {attempt + 1} failed')
+            if attempt == 20:
+                self.warning('StatusNotifierWatcher is still unavailable; retrying indicator registration')
+            self.schedule_status_notifier_watcher_refresh(expected_owner, expected_generation, attempt + 1)
+            return False
+
+        self.debug(f'StatusNotifierWatcher is ready after {attempt + 1} refresh attempts')
+        # The watcher can own its bus name before exporting its protocol interface.
+        # Reuse the existing AppIndicator objects and let PASSIVE reach it first.
         self.multi_indicator.reset()
-        self.invalid_ui = True
+        GLib.timeout_add(100, self.republish_status_notifier_watcher, expected_generation)
+        return False
+
+    def republish_status_notifier_watcher(self, expected_generation):
+        if self.status_notifier_watcher_refresh_generation == expected_generation:
+            self.debug('Republishing indicators to StatusNotifierWatcher')
+            self.multi_indicator.update()
+        return False
 
     def refresh_ui(self):
         if self.invalid_ui:
@@ -292,14 +348,18 @@ class Application(Gtk.Application):
             if len(new_indicators) == 0:
                 self.default_indicator.active = True
                 #TODO: Change icon, description, etc. Based on what?
-                self.default_indicator.menu = self.construct_idle_menu()
+                idle_menu_key = self.idle_menu_key()
+                if self.default_indicator.menu_key != idle_menu_key:
+                    self.default_indicator.set_menu(idle_menu_key, self.construct_idle_menu())
             else:
                 self.default_indicator.active = False
             self.indicators = new_indicators
             for session_id, indicator in self.indicators.items():
                 if session_id is not None:
                     #TODO: Change icon, description, etc. based on status
-                    indicator.menu = self.construct_session_menu(session_id)
+                    session_menu_key = self.session_menu_key(session_id)
+                    if indicator.menu_key != session_menu_key:
+                        indicator.set_menu(session_menu_key, self.construct_session_menu(session_id))
             self.multi_indicator.update()
             self.notifiers = new_notifiers
             self.invalid_ui = False
@@ -363,6 +423,21 @@ class Application(Gtk.Application):
             except: #TODO: Catch only expected exceptions
                 self.debug(traceback.format_exc())
                 self.warning(f'Session list refresh failed')
+                # A session can disappear while its state is being read (for
+                # example after SESSION_EXPIRED).  Do not retain that stale
+                # state: it would expose actions such as Restart and
+                # Disconnect for a session that no longer exists.
+                self.sessions = dict()
+                self.configs = dict()
+                self.config_names = dict()
+                self.name_configs = dict()
+                self.config_sessions = dict()
+                self.session_configs = dict()
+                self.session_statuses = dict()
+                self.sessions_connected = set()
+                self.invalid_sessions = True
+                self.invalid_ui = True
+                new_session_ids.clear()
             for session_id in new_session_ids:
                 session_status = self.session_statuses[session_id]
                 self.on_session_event(session_id, session_status['major'], session_status['minor'], session_status['message'])
@@ -419,6 +494,50 @@ class Application(Gtk.Application):
         menu_item.connect('activate', self.action_config_remove, config_id)
         menu.append(menu_item)
         return menu
+
+    def session_menu_action_key(self, session_id):
+        status = self.session_statuses[session_id]
+        if openvpn3.StatusMajor.CONNECTION == status['major']:
+            if openvpn3.StatusMinor.CONN_CONNECTED == status['minor']:
+                return 'pause'
+            if openvpn3.StatusMinor.CONN_PAUSED == status['minor']:
+                return 'resume'
+        return None
+
+    def menu_configuration_key(self):
+        return tuple(sorted(self.name_configs.items()))
+
+    def session_menu_key(self, session_id):
+        available_configurations = tuple(
+            (config_name, config_id)
+            for config_name, config_id in sorted(self.name_configs.items())
+            if len(self.config_sessions[config_id]) == 0
+        )
+        return (
+            self.get_session_name(session_id),
+            self.session_menu_action_key(session_id),
+            available_configurations,
+            self.settings.get_string('startup-action'),
+            self.menu_configuration_key(),
+        )
+
+    def idle_menu_key(self):
+        configurations = tuple(
+            (
+                config_name,
+                config_id,
+                tuple(
+                    (session_id, self.session_menu_action_key(session_id))
+                    for session_id in sorted(self.config_sessions[config_id])
+                ),
+            )
+            for config_name, config_id in sorted(self.name_configs.items())
+        )
+        return (
+            configurations,
+            self.settings.get_string('startup-action'),
+            self.menu_configuration_key(),
+        )
 
     def construct_menu_session(self, session_id):
         menu = Gtk.Menu()
