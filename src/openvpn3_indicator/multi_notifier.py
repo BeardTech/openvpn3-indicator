@@ -226,5 +226,10 @@ class MultiNotifier():
         self.invalid = False
 
     def close(self):
+        # Detached notifications are kept in _pending until withdrawn too.
+        for notifier in list(self._notifiers.values()) + self._pending:
+            notifier.active = False
+            self.commit_notifier(notifier)
         for notifier in list(self._notifiers.values()):
             notifier.close()
+        self._pending = list()

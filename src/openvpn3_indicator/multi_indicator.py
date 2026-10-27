@@ -50,10 +50,9 @@ class MultiIndicator():
         return self._identifier
 
     def sub_identifier(self, num):
-        suffix = f'-{self._registration_generation}' if self._registration_generation else ''
-        if num == 0:
-            return f'{self.identifier}{suffix}'
-        return f'{self.identifier}{suffix}-{num}'
+        # Separate generation and slot: generation 1, slot 0 must never
+        # reuse the path of generation 0, slot 1.
+        return f'{self.identifier}-generation-{self._registration_generation}-slot-{num}'
 
     def sub_indicator(self, num):
         while len(self._sub_indicators) <= num:
@@ -76,6 +75,7 @@ class MultiIndicator():
         self._sub_indicators = list()
         self._sub_menu_keys = list()
         self._indicators = dict()
+        self._available = True
         self.default_icon = f'{APPLICATION_NAME}'
         self.default_description = f'{APPLICATION_TITLE}'
         self.default_title = f'{APPLICATION_TITLE}'
@@ -84,6 +84,18 @@ class MultiIndicator():
 
     def invalidate(self):
         self.invalid = True
+
+    def set_available(self, available):
+        if self._available != available:
+            self._available = available
+            if not available:
+                self.reset()
+            self.invalidate()
+
+    def menu_token(self, indicator):
+        # Menus with identical labels can target different sessions. Include
+        # both logical identity and the menu object, including unkeyed menus.
+        return (indicator.identifier, indicator.menu_key, indicator.menu)
 
     class Indicator():
 
@@ -208,12 +220,12 @@ class MultiIndicator():
         target = self.sub_indicator(num)
         target.set_icon_full(indicator.icon, indicator.description)
         target.set_title(indicator.title)
-        if self._sub_menu_keys[num] != indicator.menu_key:
+        if self._sub_menu_keys[num] != self.menu_token(indicator):
             if indicator.menu:
                 target.set_menu(indicator.menu)
             else:
                 target.set_menu(Gtk.Menu())
-            self._sub_menu_keys[num] = indicator.menu_key
+            self._sub_menu_keys[num] = self.menu_token(indicator)
         target.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
 
     def hide_indicator(self, num):
@@ -233,14 +245,30 @@ class MultiIndicator():
         self.invalid = True
 
     def update(self):
+        if not self._available:
+            return
         if self.invalid:
             logging.debug('Repairing Indicators')
             indicators = list()
             for indicator in self._indicators.values():
                 if indicator.active:
                     indicators.append(indicator)
+            indicators = sorted(indicators, key=lambda i : i.order_key)
+
+            # AppIndicator does not reliably replace the D-Bus menu of an
+            # existing item after GNOME Shell has rebuilt its watcher.  A
+            # fresh item is required, otherwise its icon can represent a
+            # connected session while it still exposes the old idle menu.
+            menu_changed = any(
+                num >= len(self._sub_menu_keys)
+                or self._sub_menu_keys[num] != self.menu_token(indicator)
+                for num, indicator in enumerate(indicators)
+            )
+            if menu_changed and self._sub_indicators:
+                self.reset()
+
             num = 0
-            for indicator in sorted(indicators, key=lambda i : i.order_key):
+            for indicator in indicators:
                 self.commit_indicator(indicator, num)
                 num += 1
             for other in range(num, len(self._sub_indicators)):
@@ -248,6 +276,7 @@ class MultiIndicator():
             self.invalid=False
 
     def close(self):
+        self._available = False
         self.reset()
         for indicator in list(self._indicators.values()):
             indicator.close()

@@ -24,7 +24,7 @@ import gettext
 import logging
 import pathlib
 import re
-import sys
+import signal
 import time
 import traceback
 import webbrowser
@@ -50,7 +50,6 @@ from openvpn3_indicator.multi_indicator import MultiIndicator
 from openvpn3_indicator.multi_notifier import MultiNotifier
 from openvpn3_indicator.credential_store import CredentialStore
 from openvpn3_indicator.dialogs.about import construct_about_dialog
-from openvpn3_indicator.dialogs.system_checks import construct_appindicator_missing_dialog
 from openvpn3_indicator.dialogs.credentials import CredentialsUserInput, construct_credentials_dialog
 from openvpn3_indicator.dialogs.configuration import construct_configuration_select_dialog, construct_configuration_import_dialog, construct_configuration_remove_dialog
 from openvpn3_indicator.dialogs.notification import show_error_dialog, show_warning_notification, show_info_notification
@@ -70,6 +69,7 @@ DEFAULT_SESSION_NAME = gettext.gettext('UNKNOWN')
 STATUS_NOTIFIER_WATCHER_BUS_NAME = 'org.kde.StatusNotifierWatcher'
 STATUS_NOTIFIER_WATCHER_OBJECT_PATH = '/StatusNotifierWatcher'
 STATUS_NOTIFIER_WATCHER_INTERFACE = 'org.kde.StatusNotifierWatcher'
+TERMINAL_SESSION_STATUSES = {'SESS_REMOVED', 'SESSION_EXPIRED', 'SESS_EXPIRED', 'PROC_STOPPED', 'PROC_KILLED'}
 
 ###
 #
@@ -89,6 +89,8 @@ class Application(Gtk.Application):
         self.add_main_option('debug', ord('d'), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "Show debug info", None)
         self.add_main_option('silent', ord('s'), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "Show less info", None)
         self.clear_secret_storage = False
+        self.shutting_down = False
+        self.signal_matches = list()
         self.add_main_option('clear-secret-storage', ord('c'), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, "Remove all data stored in secret storage", None)
         self.connect('handle-local-options', self.on_handle_local_options)
         self.connect('startup', self.on_startup)
@@ -123,6 +125,15 @@ class Application(Gtk.Application):
             self.action_config_open(config_path)
 
     def on_shutdown(self, application):
+        self.shutting_down = True
+        for match in self.signal_matches:
+            match.remove()
+        self.signal_matches.clear()
+        for session in getattr(self, 'sessions', {}).values():
+            try:
+                session.StatusChangeCallback(None)
+            except Exception:
+                self.debug(traceback.format_exc())
         # Explicitly unregister the tray items.  GNOME can otherwise retain
         # stale items when the application exits during a shell transition.
         if hasattr(self, 'multi_indicator'):
@@ -132,26 +143,39 @@ class Application(Gtk.Application):
 
     def on_startup(self, data):
         self.info(f'Startup')
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum, self.on_termination_signal)
         DBusGMainLoop(set_as_default=True)
 
         bus = dbus.Bus()
         self.session_bus = bus
         self.status_notifier_watcher_refresh_generation = 0
+        self.status_notifier_watcher_owner = None
+        self.status_notifier_watcher_refresh_pending = False
         # Subscribe before the initial availability check so that a watcher
         # restart during startup cannot be missed.
-        self.session_bus.add_signal_receiver(
+        self.signal_matches.append(self.session_bus.add_signal_receiver(
             self.on_status_notifier_watcher_owner_changed,
             signal_name='NameOwnerChanged',
             dbus_interface='org.freedesktop.DBus',
             bus_name='org.freedesktop.DBus',
             arg0=STATUS_NOTIFIER_WATCHER_BUS_NAME,
-        )
-        if not self.wait_for_status_notifier_watcher():
-            logging.critical('OpenVPN Indicator requires AppIndicator to run. Please install AppIndicator plugin for your desktop.')
-            dialog = construct_appindicator_missing_dialog()
-            dialog.set_visible(True)
-            dialog.run()
-            sys.exit(1)
+        ))
+        self.signal_matches.append(self.session_bus.add_signal_receiver(
+            self.on_status_notifier_host_registered,
+            signal_name='StatusNotifierHostRegistered',
+            dbus_interface=STATUS_NOTIFIER_WATCHER_INTERFACE,
+            bus_name=STATUS_NOTIFIER_WATCHER_BUS_NAME,
+            path=STATUS_NOTIFIER_WATCHER_OBJECT_PATH,
+        ))
+        self.signal_matches.append(self.session_bus.add_signal_receiver(
+            self.on_status_notifier_properties_changed,
+            signal_name='PropertiesChanged',
+            dbus_interface='org.freedesktop.DBus.Properties',
+            bus_name=STATUS_NOTIFIER_WATCHER_BUS_NAME,
+            path=STATUS_NOTIFIER_WATCHER_OBJECT_PATH,
+            arg0=STATUS_NOTIFIER_WATCHER_INTERFACE,
+        ))
 
         self.multi_notifier = MultiNotifier(self, f'{APPLICATION_NAME}')
         self.notifiers = dict()
@@ -159,19 +183,40 @@ class Application(Gtk.Application):
         # Wait until the new watcher is ready, then republish the indicators.
 
         self.dbus = dbus.SystemBus()
-        self.config_manager = openvpn3.ConfigurationManager(self.dbus)
-        self.session_manager = openvpn3.SessionManager(self.dbus)
-        self.session_manager.SessionManagerCallback(self.on_session_manager_event)
+        self.backend_proxies_invalid = True
+        try:
+            self.config_manager = openvpn3.ConfigurationManager(self.dbus)
+            self.session_manager = openvpn3.SessionManager(self.dbus)
+            self.backend_proxies_invalid = False
+        except dbus.exceptions.DBusException:
+            self.warning('OpenVPN managers unavailable at startup; retrying', exc_info=True)
+        # Subscribe by well-known name, independent of a particular daemon
+        # owner. The SDK's proxy-bound subscription can die with that owner.
+        self.signal_matches.append(self.dbus.add_signal_receiver(
+            self.on_session_manager_signal,
+            signal_name='SessionManagerEvent',
+            dbus_interface='net.openvpn.v3.sessions',
+            bus_name='net.openvpn.v3.sessions',
+            path='/net/openvpn/v3/sessions',
+        ))
+        for service_name in ('net.openvpn.v3.sessions', 'net.openvpn.v3.configuration', 'net.openvpn.v3.log'):
+            self.signal_matches.append(self.dbus.add_signal_receiver(
+                self.on_openvpn_service_owner_changed,
+                signal_name='NameOwnerChanged',
+                dbus_interface='org.freedesktop.DBus',
+                bus_name='org.freedesktop.DBus',
+                arg0=service_name,
+            ))
 
         # Detect if the config manager version is v21 or newer
         # TODO: This can be simplified once the openvpn3 module provides
         #       a version query API
         self.manager_version = 0
-        cmgr_obj = self.dbus.get_object('net.openvpn.v3.configuration','/net/openvpn/v3/configuration')
-        cmgr_prop = dbus.Interface(cmgr_obj, dbus_interface='org.freedesktop.DBus.Properties')
-        cmgr_peer = dbus.Interface(cmgr_obj, dbus_interface='org.freedesktop.DBus.Peer')
         self.manager_version = 9999
         try:
+            cmgr_obj = self.dbus.get_object('net.openvpn.v3.configuration','/net/openvpn/v3/configuration')
+            cmgr_prop = dbus.Interface(cmgr_obj, dbus_interface='org.freedesktop.DBus.Properties')
+            cmgr_peer = dbus.Interface(cmgr_obj, dbus_interface='org.freedesktop.DBus.Peer')
             cmgr_peer.Ping()
             try:
                 cmgr_version = str(cmgr_prop.Get('net.openvpn.v3.configuration','version'))
@@ -207,15 +252,18 @@ class Application(Gtk.Application):
         self.configs = dict()
         self.sessions = dict()
         self.sessions_connected = set()
+        self.session_subscriptions = set()
         self.config_names = dict()
         self.name_configs = dict()
         self.config_sessions = dict()
         self.session_configs = dict()
+        self.session_names = dict()
         self.failed_authentications = set()
         self.session_dialogs = dict()
         self.session_statuses = dict()
 
         self.multi_indicator = MultiIndicator(f'{APPLICATION_NAME}')
+        self.multi_indicator.set_available(False)
         self.initial_indicators_published = False
         self.default_indicator = self.multi_indicator.new_indicator()
         self.default_indicator.icon=f'{APPLICATION_NAME}-idle'
@@ -249,30 +297,43 @@ class Application(Gtk.Application):
 
         GLib.timeout_add(1000, self.on_schedule)
         self.hold()
+        self.begin_status_notifier_watcher_refresh()
+        GLib.timeout_add(5000, self.check_status_notifier_watcher)
 
     def on_status_notifier_watcher_owner_changed(self, name, old_owner, new_owner):
         old_owner = str(old_owner)
         new_owner = str(new_owner)
         self.info(f'StatusNotifierWatcher owner changed from {old_owner or "<none>"} to {new_owner or "<none>"}')
-        self.status_notifier_watcher_refresh_generation += 1
-        if not new_owner:
-            # Do not leave a registration owned by the previous watcher
-            # visible while GNOME is rebuilding its StatusNotifier host.
-            if hasattr(self, 'multi_indicator'):
-                self.multi_indicator.reset()
-                # Some GNOME Shell transitions recreate the watcher without
-                # producing a second NameOwnerChanged signal.  Keep polling
-                # its readiness so the indicators are republished in that
-                # case as well.
-                self.schedule_status_notifier_watcher_refresh(
-                    None,
-                    self.status_notifier_watcher_refresh_generation,
-                )
+        self.begin_status_notifier_watcher_refresh()
+
+    def on_status_notifier_host_registered(self):
+        self.begin_status_notifier_watcher_refresh()
+
+    def on_status_notifier_properties_changed(self, interface, changed, invalidated):
+        if 'IsStatusNotifierHostRegistered' in changed or 'IsStatusNotifierHostRegistered' in invalidated:
+            self.begin_status_notifier_watcher_refresh()
+
+    def begin_status_notifier_watcher_refresh(self):
+        if self.shutting_down or not hasattr(self, 'multi_indicator'):
             return
+        self.status_notifier_watcher_refresh_generation += 1
+        self.status_notifier_watcher_refresh_pending = True
+        self.multi_indicator.set_available(False)
         self.schedule_status_notifier_watcher_refresh(
-            new_owner,
             self.status_notifier_watcher_refresh_generation,
         )
+
+    def check_status_notifier_watcher(self):
+        if self.shutting_down:
+            return False
+        if not self.status_notifier_watcher_refresh_pending:
+            try:
+                owner = self.get_status_notifier_watcher_owner()
+            except dbus.exceptions.DBusException:
+                owner = None
+            if owner is None or owner != self.status_notifier_watcher_owner:
+                self.begin_status_notifier_watcher_refresh()
+        return True
 
     def get_status_notifier_watcher_owner(self):
         owner = str(self.session_bus.get_name_owner(STATUS_NOTIFIER_WATCHER_BUS_NAME))
@@ -288,42 +349,30 @@ class Application(Gtk.Application):
             raise dbus.exceptions.DBusException('StatusNotifierWatcher owner changed during availability check')
         return owner
 
-    def wait_for_status_notifier_watcher(self, retries=20, delay=0.5):
-        for attempt in range(retries):
-            try:
-                self.get_status_notifier_watcher_owner()
-                return True
-            except dbus.exceptions.DBusException:
-                if attempt + 1 < retries:
-                    time.sleep(delay)
-        return False
-
-    def schedule_status_notifier_watcher_refresh(self, expected_owner, expected_generation, attempt=0):
+    def schedule_status_notifier_watcher_refresh(self, expected_generation, attempt=0):
         delay = min(5000, 250 * (2 ** min(attempt, 5)))
         self.debug(f'Scheduling StatusNotifierWatcher refresh attempt {attempt + 1} in {delay} ms')
         GLib.timeout_add(
             delay,
             self.refresh_status_notifier_watcher,
-            expected_owner,
             expected_generation,
             attempt,
         )
 
-    def refresh_status_notifier_watcher(self, expected_owner, expected_generation, attempt):
-        if self.status_notifier_watcher_refresh_generation != expected_generation:
+    def refresh_status_notifier_watcher(self, expected_generation, attempt):
+        if self.shutting_down or self.status_notifier_watcher_refresh_generation != expected_generation:
             return False
         try:
             current_owner = self.get_status_notifier_watcher_owner()
-            if expected_owner is not None and current_owner != expected_owner:
-                return False
         except dbus.exceptions.DBusException:
             self.debug(f'StatusNotifierWatcher refresh attempt {attempt + 1} failed')
             if attempt == 20:
                 self.warning('StatusNotifierWatcher is still unavailable; retrying indicator registration')
-            self.schedule_status_notifier_watcher_refresh(expected_owner, expected_generation, attempt + 1)
+            self.schedule_status_notifier_watcher_refresh(expected_generation, attempt + 1)
             return False
 
         self.debug(f'StatusNotifierWatcher is ready after {attempt + 1} refresh attempts')
+        self.status_notifier_watcher_owner = current_owner
         # The watcher can own its bus name before exporting its protocol interface.
         # Recreate the AppIndicator objects to avoid a stale registration.
         self.multi_indicator.reset()
@@ -331,9 +380,29 @@ class Application(Gtk.Application):
         return False
 
     def republish_status_notifier_watcher(self, expected_generation):
-        if self.status_notifier_watcher_refresh_generation == expected_generation:
+        if not self.shutting_down and self.status_notifier_watcher_refresh_generation == expected_generation:
+            # The host can disappear again between readiness and publication.
+            try:
+                if self.get_status_notifier_watcher_owner() != self.status_notifier_watcher_owner:
+                    self.begin_status_notifier_watcher_refresh()
+                    return False
+            except dbus.exceptions.DBusException:
+                self.begin_status_notifier_watcher_refresh()
+                return False
             self.debug('Republishing indicators to StatusNotifierWatcher')
-            self.multi_indicator.update()
+            try:
+                # Prepare logical menus while publication is suspended,
+                # including startup before the first periodic refresh.
+                if self.invalid_ui:
+                    self.refresh_ui()
+                self.multi_indicator.set_available(True)
+                self.multi_indicator.update()
+            except Exception:
+                self.warning('Indicator publication failed; retrying', exc_info=True)
+                self.begin_status_notifier_watcher_refresh()
+                return False
+            self.status_notifier_watcher_refresh_pending = False
+            self.invalid_sessions = True
         return False
 
     def refresh_ui(self):
@@ -341,14 +410,16 @@ class Application(Gtk.Application):
             new_indicators = dict()
             for session_id in self.sessions:
                 indicator = self.indicators.get(session_id, None)
+                session_name = self.get_session_name(session_id)
                 if indicator is None:
-                    session_name = self.get_session_name(session_id)
                     indicator = self.multi_indicator.new_indicator()
-                    indicator.icon = self.session_icon(session_id)
-                    indicator.description = f'{APPLICATION_TITLE}: {session_name}'
-                    indicator.title = f'{APPLICATION_TITLE}: {session_name}'
-                    indicator.order_key = f'1-{session_name}-{session_id}'
                     indicator.active = True
+                # Polling must update existing icons as well as menus when a
+                # status signal was missed during a daemon/shell restart.
+                indicator.icon = self.session_icon(session_id)
+                indicator.description = f'{APPLICATION_TITLE}: {session_name}'
+                indicator.title = f'{APPLICATION_TITLE}: {session_name}'
+                indicator.order_key = f'1-{session_name}-{session_id}'
                 new_indicators[session_id] = indicator
             new_notifiers = dict()
             for session_id in self.sessions:
@@ -390,6 +461,8 @@ class Application(Gtk.Application):
             self.invalid_ui = False
 
     def republish_initial_indicators(self):
+        if self.shutting_down or self.status_notifier_watcher_refresh_pending:
+            return False
         # GNOME can accept the indicator registration before it consumes the
         # D-Bus menu.  Publish it once more on the next main-loop iteration
         # so the initial menu is registered as well.
@@ -401,50 +474,129 @@ class Application(Gtk.Application):
     def refresh_sessions(self):
         if self.invalid_sessions:
             new_session_ids = set()
+            retry = False
+            rebuild = self.backend_proxies_invalid
+            try:
+                if rebuild:
+                    self.config_manager = openvpn3.ConfigurationManager(self.dbus)
+                    self.session_manager = openvpn3.SessionManager(self.dbus)
+                available_sessions = self.session_manager.FetchAvailableSessions()
+            except Exception:
+                # An unavailable list is not an empty list. Keep the last
+                # snapshot and retry; only confirmed removals clear sessions.
+                self.warning('Session list refresh failed', exc_info=True)
+                return
+
             try:
                 new_sessions = dict()
-                for session in self.session_manager.FetchAvailableSessions():
-                    session_id = str(session.GetPath())
-                    if session_id not in self.sessions:
-                        new_sessions[session_id] = session
-                        session.StatusChangeCallback(lambda major, minor, message: self.on_session_event(session_id, major, minor, message))
-                        new_session_ids.add(session_id)
-                    else:
-                        new_sessions[session_id] = self.sessions[session_id]
-                new_configs = dict()
-                for config in self.config_manager.FetchAvailableConfigs():
-                    config_id = str(config.GetPath())
-                    if config_id not in self.configs:
-                        new_configs[config_id] = config
-                    else:
-                        new_configs[config_id] = self.configs[config_id]
-                new_config_names = dict()
-                for config_id, config in new_configs.items():
-                    config_name = str(config.GetConfigName())
-                    new_config_names[config_id] = config_name
-                new_config_sessions = dict()
-                new_session_configs = dict()
-                for config_id, config_name in new_config_names.items():
-                    new_config_sessions[config_id] = list()
-                    for session_id in self.session_manager.LookupConfigName(config_name):
-                        session_id = str(session_id)
-                        new_config_sessions[config_id].append(session_id)
-                        new_session_configs[session_id] = config_id
                 new_session_statuses = dict()
-                for session_id, session in new_sessions.items():
-                    status = session.GetStatus()
+                new_session_names = dict()
+                new_session_configs = dict()
+                for session in available_sessions:
+                    session_id = str(session.GetPath())
+                    if not rebuild and session_id in self.sessions:
+                        session = self.sessions[session_id]
+                    try:
+                        status = session.GetStatus()
+                    except dbus.exceptions.DBusException as exc:
+                        if exc.get_dbus_name() in ('org.freedesktop.DBus.Error.UnknownObject', 'org.freedesktop.DBus.Error.UnknownMethod'):
+                            # This particular session vanished during refresh.
+                            retry = True
+                            continue
+                        retry = True
+                        self.warning(f'Status refresh failed for {session_id}', exc_info=True)
+                        status = self.session_statuses.get(session_id, {
+                            'major': openvpn3.StatusMajor.UNSET,
+                            'minor': openvpn3.StatusMinor.UNSET,
+                            'message': '',
+                        })
+                    new_sessions[session_id] = session
                     new_session_statuses[session_id] = {
                         'major' : openvpn3.StatusMajor(status['major']),
                         'minor' : openvpn3.StatusMinor(status['minor']),
                         'message' : str(status['message']),
                     }
+                    if new_session_statuses[session_id]['minor'].name in TERMINAL_SESSION_STATUSES:
+                        new_sessions.pop(session_id)
+                        new_session_statuses.pop(session_id)
+                        continue
+                    try:
+                        # Names are not unique; bind sessions by config path.
+                        new_session_configs[session_id] = str(session.GetProperty('config_path'))
+                        new_session_names[session_id] = str(session.GetProperty('config_name'))
+                    except dbus.exceptions.DBusException:
+                        retry = True
+                        if session_id in self.session_configs:
+                            new_session_configs[session_id] = self.session_configs[session_id]
+                        new_session_names[session_id] = self.session_names.get(session_id, DEFAULT_SESSION_NAME)
+
+                try:
+                    new_configs = dict()
+                    new_config_names = dict()
+                    for config in self.config_manager.FetchAvailableConfigs():
+                        config_id = str(config.GetPath())
+                        try:
+                            config_name = str(config.GetConfigName())
+                        except dbus.exceptions.DBusException:
+                            retry = True
+                            config_name = self.config_names.get(config_id, DEFAULT_CONFIG_NAME)
+                        new_configs[config_id] = config
+                        new_config_names[config_id] = config_name
+                except Exception:
+                    # Configuration metadata failure must not hide live VPNs.
+                    self.warning('Configuration list refresh failed', exc_info=True)
+                    retry = True
+                    new_configs = self.configs.copy()
+                    new_config_names = self.config_names.copy()
+
+                new_config_sessions = {config_id: [] for config_id in new_configs}
+                for session_id, config_id in new_session_configs.items():
+                    if config_id in new_config_sessions:
+                        new_config_sessions[config_id].append(session_id)
+
+                for session_id, session in self.sessions.items():
+                    if session_id not in new_sessions or session is not new_sessions[session_id]:
+                        try:
+                            session.StatusChangeCallback(None)
+                        except Exception:
+                            self.debug(traceback.format_exc())
+                for session_id, session in new_sessions.items():
+                    if session_id not in self.session_subscriptions or session is not self.sessions.get(session_id):
+                        try:
+                            session.StatusChangeCallback(
+                                lambda major, minor, message, session_id=session_id: self.on_session_event(session_id, major, minor, message)
+                            )
+                            self.session_subscriptions.add(session_id)
+                        except Exception:
+                            # Status polling remains available if subscribing
+                            # fails while the log daemon is restarting.
+                            self.warning(f'Status subscription failed for {session_id}', exc_info=True)
+                            self.session_subscriptions.discard(session_id)
+                            try:
+                                session.StatusChangeCallback(None)
+                            except Exception:
+                                self.debug(traceback.format_exc())
+                            retry = True
+                        if session_id not in self.sessions:
+                            new_session_ids.add(session_id)
                 self.sessions = new_sessions
                 self.configs = new_configs
                 self.config_names = new_config_names
-                self.name_configs = dict([(value, key) for key,value in new_config_names.items()])
+                # Legacy STARTNAME settings are only safe for unique names.
+                name_configs = dict()
+                for config_id, config_name in new_config_names.items():
+                    if config_name in name_configs:
+                        name_configs[config_name] = None
+                    else:
+                        name_configs[config_name] = config_id
+                self.name_configs = name_configs
                 self.config_sessions = new_config_sessions
                 self.session_configs = new_session_configs
+                self.session_names = new_session_names
                 self.session_statuses = new_session_statuses
+                self.sessions_connected.intersection_update(new_sessions)
+                self.session_subscriptions.intersection_update(new_sessions)
+                self.backend_proxies_invalid = False
 
                 self.debug(f'Configs: {sorted(self.configs.keys())}')
                 self.debug(f'Sessions: {sorted(self.sessions.keys())}')
@@ -452,40 +604,25 @@ class Application(Gtk.Application):
                 self.debug(f'Config sessions: {self.config_sessions}')
                 self.debug(f'Session configs: {self.session_configs}')
                 self.debug(f'Session statuses: {self.session_statuses}')
-                self.invalid_sessions = False
+                self.invalid_sessions = retry
                 self.invalid_ui = True
-            except: #TODO: Catch only expected exceptions
-                self.debug(traceback.format_exc())
-                self.warning(f'Session list refresh failed')
-                # A session can disappear while its state is being read (for
-                # example after SESSION_EXPIRED).  Do not retain that stale
-                # state: it would expose actions such as Restart and
-                # Disconnect for a session that no longer exists.
-                self.sessions = dict()
-                self.configs = dict()
-                self.config_names = dict()
-                self.name_configs = dict()
-                self.config_sessions = dict()
-                self.session_configs = dict()
-                self.session_statuses = dict()
-                self.sessions_connected = set()
-                self.invalid_sessions = True
-                self.invalid_ui = True
-                new_session_ids.clear()
+            except Exception:
+                self.warning('Session state refresh failed', exc_info=True)
+                return
             for session_id in new_session_ids:
                 session_status = self.session_statuses[session_id]
                 self.on_session_event(session_id, session_status['major'], session_status['minor'], session_status['message'])
             for session_id, dialog in list(self.session_dialogs.items()):
                 if session_id not in self.sessions:
                     dialog.destroy()
-                    if session_id not in self.sessions:
-                        del self.session_dialogs[session_id]
+                    self.session_dialogs.pop(session_id, None)
 
     def get_config_name(self, config_id):
         return self.config_names.get(config_id, DEFAULT_CONFIG_NAME)
 
     def get_session_name(self, session_id):
-        return self.get_config_name(self.session_configs.get(session_id, ''))
+        config_id = self.session_configs.get(session_id, '')
+        return self.config_names.get(config_id, self.session_names.get(session_id, DEFAULT_SESSION_NAME))
 
     def action_settings_startup(self, _object, value):
         self.settings.set_string('startup-action', value)
@@ -509,10 +646,12 @@ class Application(Gtk.Application):
         menu_item = Gtk.MenuItem.new_with_label(menu_title)
         menu_item.connect('activate', self.action_settings_startup, menu_action)
         menu.append(menu_item)
-        for config_name, config_id in sorted(self.name_configs.items()):
-            menu_action = f'STARTNAME:{config_name}'
+        for config_name, config_id in self.menu_configuration_key():
+            menu_action = f'STARTID:{config_id}'
             menu_title = gettext.gettext('Start {name}').format(name=config_name)
-            if startup_action == menu_action:
+            if startup_action == menu_action or (
+                startup_action == f'STARTNAME:{config_name}' and self.name_configs.get(config_name) == config_id
+            ):
                 menu_title += ' ✓'
             menu_item = Gtk.MenuItem.new_with_label(menu_title)
             menu_item.connect('activate', self.action_settings_startup, menu_action)
@@ -539,15 +678,16 @@ class Application(Gtk.Application):
         return None
 
     def menu_configuration_key(self):
-        return tuple(sorted(self.name_configs.items()))
+        return tuple(sorted((name, config_id) for config_id, name in self.config_names.items()))
 
     def session_menu_key(self, session_id):
         available_configurations = tuple(
             (config_name, config_id)
-            for config_name, config_id in sorted(self.name_configs.items())
+            for config_name, config_id in self.menu_configuration_key()
             if len(self.config_sessions[config_id]) == 0
         )
         return (
+            session_id,
             self.get_session_name(session_id),
             self.session_menu_action_key(session_id),
             available_configurations,
@@ -565,7 +705,7 @@ class Application(Gtk.Application):
                     for session_id in sorted(self.config_sessions[config_id])
                 ),
             )
-            for config_name, config_id in sorted(self.name_configs.items())
+            for config_name, config_id in self.menu_configuration_key()
         )
         return (
             configurations,
@@ -607,7 +747,7 @@ class Application(Gtk.Application):
         menu = self.construct_menu_session(session_id)
         menu.append(Gtk.SeparatorMenuItem())
         add_separator = False
-        for config_name, config_id in sorted(self.name_configs.items()):
+        for config_name, config_id in self.menu_configuration_key():
             if len(self.config_sessions[config_id]) == 0:
                 config_menu = self.construct_menu_config(config_id)
                 menu_item = Gtk.MenuItem.new_with_label(config_name)
@@ -633,7 +773,7 @@ class Application(Gtk.Application):
 
     def construct_idle_menu(self):
         menu = Gtk.Menu()
-        for config_name, config_id in sorted(self.name_configs.items()):
+        for config_name, config_id in self.menu_configuration_key():
             session_ids = self.config_sessions[config_id]
             if len(session_ids) > 0:
                 for session_id in session_ids:
@@ -648,7 +788,7 @@ class Application(Gtk.Application):
                 menu_item = Gtk.MenuItem.new_with_label(config_name)
                 menu_item.set_submenu(config_menu)
                 menu.append(menu_item)
-        if len(self.name_configs) > 0:
+        if len(self.config_names) > 0:
             menu.append(Gtk.SeparatorMenuItem())
         menu_item = Gtk.MenuItem.new_with_label(gettext.gettext('Import Config'))
         menu_item.connect('activate', self.action_config_import)
@@ -695,7 +835,41 @@ class Application(Gtk.Application):
         if openvpn3.SessionManagerEventType.SESS_CREATED == event_type:
             self.invalid_sessions = True
         elif openvpn3.SessionManagerEventType.SESS_DESTROYED == event_type:
+            self.remove_session(str(event.GetPath()))
             self.invalid_sessions = True
+
+    def on_session_manager_signal(self, path, event_type, owner):
+        self.on_session_manager_event(openvpn3.SessionManagerEvent(path, event_type, owner))
+
+    def on_openvpn_service_owner_changed(self, name, old_owner, new_owner):
+        if self.shutting_down or not hasattr(self, 'sessions'):
+            return
+        self.info(f'OpenVPN service {name} owner changed')
+        # Session/configuration proxies and log subscriptions are bound to
+        # the old unique owner. Rebuild them on the next successful refresh.
+        self.backend_proxies_invalid = True
+        self.invalid_sessions = True
+
+    def remove_session(self, session_id):
+        session = self.sessions.pop(session_id, None)
+        if session is not None:
+            try:
+                session.StatusChangeCallback(None)
+            except Exception:
+                self.debug(traceback.format_exc())
+        self.session_statuses.pop(session_id, None)
+        self.session_configs.pop(session_id, None)
+        self.session_names.pop(session_id, None)
+        self.sessions_connected.discard(session_id)
+        self.session_subscriptions.discard(session_id)
+        for session_ids in self.config_sessions.values():
+            if session_id in session_ids:
+                session_ids.remove(session_id)
+        dialog = self.session_dialogs.pop(session_id, None)
+        if dialog is not None:
+            dialog.destroy()
+        self.invalid_sessions = True
+        self.invalid_ui = True
 
     def on_network_manager_event(self, event):
         self.info(f'Network Manager Event {event}')
@@ -730,6 +904,10 @@ class Application(Gtk.Application):
         }
         self.invalid_ui = True
 
+        if minor.name in TERMINAL_SESSION_STATUSES:
+            self.remove_session(session_id)
+            return
+
         if openvpn3.StatusMajor.CONNECTION == major and openvpn3.StatusMinor.CFG_OK == minor:
             try:
                 if session_id not in self.sessions_connected:
@@ -740,8 +918,6 @@ class Application(Gtk.Application):
                 self.debug(traceback.format_exc())
         if openvpn3.StatusMajor.SESSION == major and openvpn3.StatusMinor.SESS_AUTH_URL == minor:
             self.action_auth_url(None, session_id, message)
-        if openvpn3.StatusMajor.SESSION == major and openvpn3.StatusMinor.PROC_STOPPED == minor:
-            pass
         if openvpn3.StatusMajor.CONNECTION == major and openvpn3.StatusMinor.CONN_AUTH_FAILED == minor:
             #TODO: Notify authentication failure
             #TODO: Record authentication failure
@@ -845,12 +1021,15 @@ class Application(Gtk.Application):
                     del self.session_dialogs[session_id]
 
             def on_connect(user_inputs, store):
+                if self.shutting_down or session_id not in self.sessions:
+                    return
                 credentials = dict([ (ui.name, ui.value) for ui in user_inputs ])
-                if store:
-                    store_credentials = dict([ (ui.name, ui.value) for ui in user_inputs if ui.can_store and ui.value ])
-                    self.store_set_credentials(config_id, store_credentials)
-                else:
-                    self.store_clear_credentials(config_id, credentials.keys())
+                if config_id is not None:
+                    if store:
+                        store_credentials = dict([ (ui.name, ui.value) for ui in user_inputs if ui.can_store and ui.value ])
+                        self.store_set_credentials(config_id, store_credentials)
+                    else:
+                        self.store_clear_credentials(config_id, credentials.keys())
                 if session_id in self.session_dialogs:
                     del self.session_dialogs[session_id]
                 self.on_session_credentials(session_id, credentials)
@@ -875,7 +1054,9 @@ class Application(Gtk.Application):
             self.on_session_credentials(session_id, credentials)
 
     def on_session_credentials(self, session_id, credentials):
-        session = self.sessions[session_id]
+        session = self.sessions.get(session_id)
+        if self.shutting_down or session is None:
+            return
         try:
             for input_slot in session.FetchUserInputSlots():
                 if input_slot.GetTypeGroup()[0] != openvpn3.ClientAttentionType.CREDENTIALS:
@@ -889,6 +1070,19 @@ class Application(Gtk.Application):
             self.action_session_disconnect(None, session_id)
 
     def on_schedule(self):
+        if self.shutting_down:
+            return False
+        try:
+            self.refresh_scheduled_state()
+        except Exception:
+            # GLib removes a timeout whose callback raises. Keep this timer
+            # alive so a transient error cannot freeze the menu permanently.
+            self.warning('Scheduled refresh failed; retrying', exc_info=True)
+            self.invalid_sessions = True
+            self.invalid_ui = True
+        return True
+
+    def refresh_scheduled_state(self):
         self.debug(f'Schedule')
         if self.last_invalid + 30 < time.monotonic():
             self.debug('Forced refresh of sessions')
@@ -899,14 +1093,13 @@ class Application(Gtk.Application):
         if self.invalid_ui:
             self.refresh_ui()
         self.multi_notifier.update()
-        if self.startup_config_id or self.startup_config_name:
+        if not self.invalid_sessions and (self.startup_config_id or self.startup_config_name):
             config_id = self.startup_config_id or self.name_configs.get(self.startup_config_name, None)
-            if config_id and len(self.config_sessions[config_id]) == 0:
+            if config_id in self.configs and len(self.config_sessions.get(config_id, [])) == 0:
                 self.debug(f'Starting config {config_id} as requested in startup settings.')
                 self.action_config_connect(None, config_id)
             self.startup_config_id = None
             self.startup_config_name = None
-        GLib.timeout_add(1000, self.on_schedule)
 
     def action_config_connect(self, _object, config_id):
         self.info(f'Connect Config {config_id}')
@@ -1090,7 +1283,11 @@ class Application(Gtk.Application):
 
     def action_quit(self, _object):
         self.info(f'Quit')
-        self.release()
+        self.quit()
+
+    def on_termination_signal(self):
+        self.quit()
+        return False
 
     def logging_notify(self, msg, title=f'{APPLICATION_NAME}', icon='active'):
         icon = f'{APPLICATION_NAME}-{icon}'

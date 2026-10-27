@@ -3,6 +3,7 @@
 import argparse
 import pathlib
 import subprocess
+import tempfile
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--directory', required=True)
@@ -19,8 +20,18 @@ header = f'#!{args.python}\n'.encode()
 
 binary = subprocess.run(
             ['zip', '-', '--recurse-paths', '-9', '.', ],
-            cwd=directory, stdout=subprocess.PIPE
+            cwd=directory, stdout=subprocess.PIPE, check=True
         ).stdout
 
-executable.write_bytes(header + binary)
-executable.chmod(0o755)
+# Replace the artifact atomically. A previous sudo build can leave the old
+# file owned by root even though its parent directory remains writable.
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(dir=executable.parent, prefix=f'.{executable.name}-', delete=False) as output:
+        temporary = pathlib.Path(output.name)
+        output.write(header + binary)
+    temporary.chmod(0o755)
+    temporary.replace(executable)
+finally:
+    if temporary is not None and temporary.exists():
+        temporary.unlink()
